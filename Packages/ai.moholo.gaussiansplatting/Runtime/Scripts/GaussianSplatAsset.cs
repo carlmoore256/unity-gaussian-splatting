@@ -36,6 +36,20 @@ namespace GaussianSplatting
         {
             return new GaussianSplatData(_data);
         }
+
+        public void LoadFromPly(byte[] plyBytes, CoordinateConversion conversion = CoordinateConversion.RightHandedToUnity)
+        {
+            var data = PlyGaussianSplatLoader.Load(plyBytes, conversion);
+            SetData(data);
+        }
+
+        public static GaussianSplatAsset CreateFromPly(byte[] plyBytes, CoordinateConversion conversion = CoordinateConversion.RightHandedToUnity, string sourcePath = null)
+        {
+            var asset = CreateInstance<GaussianSplatAsset>();
+            asset.LoadFromPly(plyBytes, conversion);
+            asset.SourcePath = sourcePath;
+            return asset;
+        }
     }
 }
 
