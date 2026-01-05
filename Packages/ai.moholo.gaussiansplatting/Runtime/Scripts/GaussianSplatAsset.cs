@@ -43,11 +43,25 @@ namespace GaussianSplatting
             SetData(data);
         }
 
+        public void LoadFromPlyFile(string filePath, CoordinateConversion conversion = CoordinateConversion.RightHandedToUnity)
+        {
+            var bytes = System.IO.File.ReadAllBytes(filePath);
+            LoadFromPly(bytes, conversion);
+            SourcePath = filePath;
+        }
+
         public static GaussianSplatAsset CreateFromPly(byte[] plyBytes, CoordinateConversion conversion = CoordinateConversion.RightHandedToUnity, string sourcePath = null)
         {
             var asset = CreateInstance<GaussianSplatAsset>();
             asset.LoadFromPly(plyBytes, conversion);
             asset.SourcePath = sourcePath;
+            return asset;
+        }
+
+        public static GaussianSplatAsset CreateFromPlyFile(string filePath, CoordinateConversion conversion = CoordinateConversion.RightHandedToUnity)
+        {
+            var asset = CreateInstance<GaussianSplatAsset>();
+            asset.LoadFromPlyFile(filePath, conversion);
             return asset;
         }
     }
