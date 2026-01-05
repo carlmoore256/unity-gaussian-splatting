@@ -70,3 +70,4 @@ crashlytics-build.properties
 # PLY files (Gaussian Splatting data files - typically large)
 *.ply
 
+.DS_Store

@@ -1,5 +1,10 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
 using UnityEngine;
+using UnityEngine.Networking;
 using UnityEngine.Rendering;
 
 namespace GaussianSplatting
@@ -9,7 +14,7 @@ namespace GaussianSplatting
     /// </summary>
     public enum SortAlgorithm
     {
-        /// <summary>Bitonic sort - fastest in most cases, fewer dispatches, better for large splat counts (>500K)</summary>
+        /// <summary>Bitonic sort - fastest in most cases, fewer dispatches, better for large splat counts (&gt;500K)</summary>
         Bitonic,
         /// <summary>Radix sort - 4 passes</summary>
         Radix,
@@ -18,7 +23,7 @@ namespace GaussianSplatting
     }
 
     [ExecuteAlways]
-    public sealed class GaussianSplatRenderer : MonoBehaviour, ISerializationCallbackReceiver
+    public class GaussianSplatRenderer : MonoBehaviour, ISerializationCallbackReceiver
     {
         // Helper to pack two floats into a single uint using half-precision (16-bit float)
         private static uint PackHalf2x16(float x, float y)
@@ -27,7 +32,7 @@ namespace GaussianSplatting
             ushort hy = FloatToHalf(y);
             return (uint)hx | ((uint)hy << 16);
         }
-
+        
         // Convert float to half-precision (IEEE 754 binary16)
         private static ushort FloatToHalf(float value)
         {
@@ -35,7 +40,7 @@ namespace GaussianSplatting
             int s = (i >> 16) & 0x8000;
             int e = ((i >> 23) & 0xff) - 127 + 15;
             int m = i & 0x7fffff;
-
+            
             if (e <= 0)
             {
                 if (e < -10) return (ushort)s;
@@ -65,7 +70,7 @@ namespace GaussianSplatting
             float qx = rotation.x, qy = rotation.y, qz = rotation.z, qw = rotation.w;
             float len = Mathf.Sqrt(qx*qx + qy*qy + qz*qz + qw*qw);
             if (len > 0.0001f) { qx /= len; qy /= len; qz /= len; qw /= len; }
-
+            
             // Rotation matrix R from quaternion (column-major for math, row-major in code)
             // Using standard quaternion-to-matrix formula with q = (w, x, y, z)
             float r00 = 1f - 2f * (qy*qy + qz*qz);
@@ -77,12 +82,12 @@ namespace GaussianSplatting
             float r20 = 2f * (qx*qz - qw*qy);
             float r21 = 2f * (qy*qz + qw*qx);
             float r22 = 1f - 2f * (qx*qx + qy*qy);
-
+            
             // M = R * S where S is diagonal scale matrix
             float m00 = r00 * scale.x, m01 = r01 * scale.y, m02 = r02 * scale.z;
             float m10 = r10 * scale.x, m11 = r11 * scale.y, m12 = r12 * scale.z;
             float m20 = r20 * scale.x, m21 = r21 * scale.y, m22 = r22 * scale.z;
-
+            
             // Covariance V = M * M^T (symmetric 3x3 matrix)
             // Only compute 6 unique values
             float v00 = m00*m00 + m01*m01 + m02*m02;
@@ -91,10 +96,24 @@ namespace GaussianSplatting
             float v11 = m10*m10 + m11*m11 + m12*m12;
             float v12 = m10*m20 + m11*m21 + m12*m22;
             float v22 = m20*m20 + m21*m21 + m22*m22;
-
+            
             covA = new Vector3(v00, v01, v02);
             covB = new Vector3(v11, v12, v22);
         }
+
+        [Header("Input - StreamingAssets or URL")]
+        [Tooltip("Full URL to load PLY from (disables Streaming Assets). Example: https://example.com/splat.ply")]
+        public string PlyUrl = "";
+        
+        [Tooltip("PLY filename in StreamingAssets/GaussianSplatting/ folder (e.g., 'testsplat.ply'). Used if PlyUrl is empty.")]
+        public string PlyFileName = "testsplat.ply";
+        
+        [System.NonSerialized]
+        [HideInInspector]
+        public GaussianSplatAsset PlyAsset;
+        
+        [System.NonSerialized]
+        private string _lastLoadedSource = ""; // Track last loaded file/URL
 
         [Header("Rendering")]
         [Tooltip("Material using the unified GaussianSplatting/Gaussian Splat shader. The shader automatically selects the correct SubShader for Vulkan/Metal/D3D vs GLES.")]
@@ -105,76 +124,77 @@ namespace GaussianSplatting
         [Tooltip("Scale multiplier for all splats.")]
         [Range(0.1f, 5.0f)]
         public float ScaleMultiplier = 1.0f;
-
         [Tooltip("Limit number of splats to LOAD (0 = load all). Reduces sorting overhead for debugging.")]
         [Min(0)]
         public int MaxSplatsToLoad = 0;
-
+        
         [Header("Performance")]
         [Tooltip("How often to sort splats (in frames). 1 = every frame, 2 = every other frame, etc.")]
         [Range(1, 90)]
         public int SortEveryNFrames = 1;
-
+        
         [Tooltip("Use URP Render Feature for proper matrix setup. Add GaussianSplatRenderFeature to your URP Renderer.")]
         public bool UseRenderFeature = false;
-
+        
         [Tooltip("Enable GPU frustum culling to skip off-screen splats. Improves performance when only part of the scene is visible.")]
         public bool EnableFrustumCulling = true;
-
         [Tooltip("Extra margin for frustum culling in NDC space. Larger values prevent popping at screen edges but reduce culling efficiency.")]
         [Range(0.0f, 1.0f)]
         public float FrustumCullMargin = 0.3f;
-
+        
         [Tooltip("Sort algorithm. Bitonic is fastest and default - simpler with fewer dispatches, better for very large splat counts. Radix is alternative. None is for testing only - will look wrong.")]
         public SortAlgorithm SortingAlgorithm = SortAlgorithm.Bitonic;
-
+        
         [HideInInspector]
         [Tooltip("Log performance metrics every N frames (0 = disabled)")]
         public int LogPerformanceEveryNFrames = 0;
 
-        private GaussianSplatData _splatData;
-        private GraphicsBuffer _orderBuffer;
-        private GraphicsBuffer _centersBuffer;
-        private GraphicsBuffer _rotationsBuffer;
-        private GraphicsBuffer _scalesBuffer;
-        private GraphicsBuffer _colorsBuffer;
-        private GraphicsBuffer _shCoeffsBuffer;
-
-        // GLES packed buffers (4 SSBOs strict for GLES 3.1)
-        private GraphicsBuffer _glesPosScale;    // float4: xyz=center, w=cov.xx
+        // Packed buffers (4 SSBOs - works on ALL platforms: Vulkan, Metal, D3D, GLES)
+        private GraphicsBuffer _glesPosScale;    // float4: pos.xyz, cov.xx
         private GraphicsBuffer _glesRotation;    // float4: cov.xy, cov.xz, cov.yy, cov.yz
-        private GraphicsBuffer _glesColor;       // float4: cov.zz, unused, packHalf(color.rg), packHalf(color.ba)
-
-        private int _shBands;
-        private int _shCoeffsPerSplat;
+        private GraphicsBuffer _glesColor;       // float4: cov.zz, unused, colorRG_packed, colorBA_packed
 
         private uint[] _orderCpu = Array.Empty<uint>();
         private Vector3[] _centersCpu = Array.Empty<Vector3>();
         private int _count;
-        private int _visibleCount;
 
-        // scratch buffers for sorting (similar to gsplat-sort-worker.js)
-        private uint[] _distances = Array.Empty<uint>();
-        private uint[] _countBuffer = Array.Empty<uint>();
-
-        private Vector3 _lastCamPos;
-        private Vector3 _lastCamDir;
         private Bounds _localBounds;
         private Bounds _worldBounds;
 
-        private GaussianSplatGPUSorter _gpuSorter;
-        private GaussianSplatGPUSorterGLES _gpuSorterGLES;
-        private GaussianSplatBitonicSorter _gpuSorterBitonic;
+        private GaussianMeshDeformer _meshDeformer;
         private MaterialPropertyBlock _mpb;
-        private GaussianSplatData _loadedData; // Track which data is currently loaded
+        private GaussianSplatAsset _loadedAsset; // Track which asset is currently loaded
         private Material _activeMaterial; // The material currently in use
-        private bool _isUsingGLES; // Track if we're using GLES path
-
+        
+        // GPU covariance precompute
+        private ComputeShader _precomputeShader;
+        private int _precomputeKernel;
+        private const int GPU_PRECOMPUTE_THRESHOLD = 50000; // Use GPU for splat counts above this
+        
         [System.NonSerialized]
         private bool _needsReload = false; // Set to true after deserialization to force buffer reload
-
+        
         private int _frameCounter = 0; // Track frames for sort frequency
-
+        
+        // Per-camera rendering state (needed because Scene View and Game View can render simultaneously)
+        private class CameraRenderState
+        {
+            public GraphicsBuffer OrderBuffer;
+            public GaussianSplatBitonicSorter BitonicSorter;
+            public GaussianSplatRadixSorter RadixSorter;
+            public int VisibleCount;
+            public int LastFrameUsed;
+            
+            public void Dispose()
+            {
+                OrderBuffer?.Release();
+                BitonicSorter?.Dispose();
+                RadixSorter?.Dispose();
+            }
+        }
+        private Dictionary<Camera, CameraRenderState> _cameraStates = new Dictionary<Camera, CameraRenderState>();
+        private const int CAMERA_STATE_EXPIRY_FRAMES = 300; // Clean up unused camera states after 5 seconds at 60fps
+        
         // Performance tracking
         private float _lastSortTimeMs = 0f;
         private float _avgSortTimeMs = 0f;
@@ -184,24 +204,64 @@ namespace GaussianSplatting
         private float _lastFrameTime = 0f;
         private bool _firstRenderLogged = false;
 
-        public bool IsLoaded => _count > 0 && _orderBuffer != null;
-        public int SplatCount => _count;
-
         private void OnEnable()
         {
+            Debug.Log($"[GaussianSplatRenderer] OnEnable called. isPlaying={Application.isPlaying}, PlyAsset={PlyAsset}, PlyUrl={PlyUrl}, PlyFileName={PlyFileName}");
+            
             RenderPipelineManager.beginCameraRendering += BeginCameraRendering;
             if (_mpb == null) _mpb = new MaterialPropertyBlock();
-
-            if (_splatData != null)
+            
+            // In play mode: auto-load from URL or StreamingAssets
+            if (Application.isPlaying)
             {
-                LoadToGPU();
+                string currentSource = GetCurrentSource();
+                if (PlyAsset == null && !string.IsNullOrEmpty(currentSource))
+                {
+                    Debug.Log($"[GaussianSplatRenderer] Starting runtime load from '{currentSource}'");
+                    StartCoroutine(LoadPlyRuntime());
+                }
+                else if (PlyAsset != null)
+                {
+                    Debug.Log($"[GaussianSplatRenderer] Asset already loaded, loading to GPU");
+                    TryLoad();
+                }
+            }
+            // In edit mode: try to load GPU buffers if we have an asset
+            // (Editor script will handle loading the asset file itself if PlyAsset is null)
+            else
+            {
+                if (PlyAsset != null)
+                {
+                    Debug.Log($"[GaussianSplatRenderer] Edit mode: loading existing asset to GPU");
+                    TryLoad();
+                }
+                // If PlyAsset is null but we have a URL/filename, editor script will reload it
+                // This handles the case where asset was destroyed when exiting Play mode
+            }
+        }
+        
+        private string GetCurrentSource()
+        {
+            // URL takes precedence
+            if (!string.IsNullOrEmpty(PlyUrl))
+                return PlyUrl;
+            return PlyFileName;
+        }
+
+        private void OnDestroy()
+        {
+            // Clean up runtime-loaded asset (only in play mode)
+            if (PlyAsset != null && Application.isPlaying)
+            {
+                Destroy(PlyAsset);
             }
         }
 
         private void OnDisable()
         {
             RenderPipelineManager.beginCameraRendering -= BeginCameraRendering;
-            // In edit mode, keep the data but release GPU buffers
+            
+            // In edit mode, keep the asset but release GPU buffers
             // In play mode, release everything
             if (!Application.isPlaying)
             {
@@ -213,24 +273,17 @@ namespace GaussianSplatting
             }
         }
 
-        private void OnDestroy()
-        {
-            Release();
-        }
-
         private void ReleaseBuffersOnly()
         {
             // Release GPU buffers but keep CPU data
-            _gpuSorter?.Dispose(); _gpuSorter = null;
-            _gpuSorterGLES?.Dispose(); _gpuSorterGLES = null;
-            _gpuSorterBitonic?.Dispose(); _gpuSorterBitonic = null;
-            _orderBuffer?.Release(); _orderBuffer = null;
-            _centersBuffer?.Release(); _centersBuffer = null;
-            _rotationsBuffer?.Release(); _rotationsBuffer = null;
-            _scalesBuffer?.Release(); _scalesBuffer = null;
-            _colorsBuffer?.Release(); _colorsBuffer = null;
-            _shCoeffsBuffer?.Release(); _shCoeffsBuffer = null;
-            // GLES packed buffers
+            foreach (var state in _cameraStates.Values)
+            {
+                state.Dispose();
+            }
+            _cameraStates.Clear();
+            
+            _meshDeformer?.Dispose(); _meshDeformer = null;
+            // Packed buffers
             _glesPosScale?.Release(); _glesPosScale = null;
             _glesRotation?.Release(); _glesRotation = null;
             _glesColor?.Release(); _glesColor = null;
@@ -239,113 +292,104 @@ namespace GaussianSplatting
         private void OnValidate()
         {
             if (!isActiveAndEnabled) return;
-
-            if (_splatData != null)
+            
+            string currentSource = GetCurrentSource();
+            
+            // Check if source changed in play mode - trigger reload
+            if (Application.isPlaying && currentSource != _lastLoadedSource && !string.IsNullOrEmpty(currentSource))
             {
-                LoadToGPU();
+                Debug.Log($"[GaussianSplatRenderer] Source changed from '{_lastLoadedSource}' to '{currentSource}', reloading...");
+                // Clear current asset and trigger reload
+                if (PlyAsset != null)
+                {
+                    Destroy(PlyAsset);
+                    PlyAsset = null;
+                }
+                StartCoroutine(LoadPlyRuntime());
+            }
+            // In edit mode with asset loaded, reload GPU buffers
+            else if (!Application.isPlaying && PlyAsset != null)
+            {
+                TryLoad();
+            }
+            // In play mode with asset loaded, reload GPU buffers
+            else if (Application.isPlaying && PlyAsset != null)
+            {
+                TryLoad();
             }
         }
 
         private void Release()
         {
-            _gpuSorter?.Dispose(); _gpuSorter = null;
-            _gpuSorterGLES?.Dispose(); _gpuSorterGLES = null;
-            _gpuSorterBitonic?.Dispose(); _gpuSorterBitonic = null;
-            _orderBuffer?.Release(); _orderBuffer = null;
-            _centersBuffer?.Release(); _centersBuffer = null;
-            _rotationsBuffer?.Release(); _rotationsBuffer = null;
-            _scalesBuffer?.Release(); _scalesBuffer = null;
-            _colorsBuffer?.Release(); _colorsBuffer = null;
-            _shCoeffsBuffer?.Release(); _shCoeffsBuffer = null;
-            // GLES packed buffers
+            // Release per-camera states
+            foreach (var state in _cameraStates.Values)
+            {
+                state.Dispose();
+            }
+            _cameraStates.Clear();
+            
+            _meshDeformer?.Dispose(); _meshDeformer = null;
+            // Packed buffers
             _glesPosScale?.Release(); _glesPosScale = null;
             _glesRotation?.Release(); _glesRotation = null;
             _glesColor?.Release(); _glesColor = null;
-
+            
             _orderCpu = Array.Empty<uint>();
             _centersCpu = Array.Empty<Vector3>();
-            _distances = Array.Empty<uint>();
-            _countBuffer = Array.Empty<uint>();
             _count = 0;
-            _visibleCount = 0;
-            _shBands = 0;
-            _shCoeffsPerSplat = 0;
             _localBounds = new Bounds(Vector3.zero, Vector3.zero);
             _worldBounds = new Bounds(Vector3.zero, Vector3.zero);
-            _loadedData = null;
+            _loadedAsset = null;
         }
 
         /// <summary>
-        /// Set splat data from external source (e.g. network, custom loader).
-        /// This is the primary way to load splat data - no internal file loading.
+        /// Public method for editor to trigger loading
         /// </summary>
-        public void SetSplatData(GaussianSplatData data)
+        public void LoadAssetToGPU()
         {
-            _splatData = data;
-            _needsReload = true;
-            _loadedData = null;
+            TryLoad();
+        }
 
-            if (isActiveAndEnabled && data != null)
+        private void TryLoad()
+        {
+            if (PlyAsset == null)
             {
-                LoadToGPU();
-            }
-        }
-
-        /// <summary>
-        /// Get the currently loaded splat data.
-        /// </summary>
-        public GaussianSplatData GetSplatData()
-        {
-            return _splatData;
-        }
-
-        /// <summary>
-        /// Force reload of GPU buffers from current splat data.
-        /// </summary>
-        [ContextMenu("Force Reload Splat")]
-        public void ForceReload()
-        {
-            _needsReload = true;
-            _loadedData = null;
-            ReleaseBuffersOnly();
-
-            if (_splatData != null)
-            {
-                LoadToGPU();
-            }
-        }
-
-        private void LoadToGPU()
-        {
-            if (_splatData == null || Material == null)
+                Debug.LogWarning("[GaussianSplatRenderer] TryLoad: PlyAsset is null");
                 return;
+            }
+            
+            if (Material == null)
+            {
+                Debug.LogWarning("[GaussianSplatRenderer] TryLoad: Material is null");
+                return;
+            }
 
-            // Determine if we need GLES path (affects buffer layout, not material selection)
-            // The unified shader has SubShaders for both APIs - Unity selects the correct one automatically
-            _isUsingGLES = SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.OpenGLES3 ||
-                           SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.OpenGLES2;
-
-            // Use the single unified material - shader has SubShaders for Vulkan/Metal/D3D and GLES
+            // Use unified shader with packed buffers on ALL platforms (Vulkan, Metal, D3D, GLES)
+            // This ensures consistency and avoids Vulkan "missing bindings" issues
             _activeMaterial = Material;
+            
+            Debug.Log($"[GaussianSplatRenderer] Using unified shader with packed buffers (4 SSBOs). Graphics API: {SystemInfo.graphicsDeviceType}");
 
             // Force reload if deserialization occurred (e.g., after scene save/load)
-            // or if buffers don't exist or data changed
-            bool needsReload = _needsReload || _orderBuffer == null || _loadedData != _splatData || _count == 0;
+            // or if buffers don't exist or asset changed
+            bool needsReload = _needsReload || _glesPosScale == null || _loadedAsset != PlyAsset || _count == 0;
+            
             if (!needsReload)
+            {
+                Debug.Log($"[GaussianSplatRenderer] TryLoad: skipping reload (_count={_count}, _loadedAsset={_loadedAsset?.name})");
                 return;
+            }
 
-            _needsReload = false;
-            ReleaseBuffersOnly();
-            _loadedData = _splatData;
+            Debug.Log($"[GaussianSplatRenderer] TryLoad: loading {PlyAsset.name} to GPU ({PlyAsset.Count} splats)");
+            _needsReload = false; // Clear the flag
+            Release();
+            _loadedAsset = PlyAsset;
 
-            int count = _splatData.Count;
-            Vector3[] centers = _splatData.Centers;
-            Vector4[] rotations = _splatData.Rotations;
-            Vector3[] scales = _splatData.Scales;
-            Vector4[] colors = _splatData.Colors;
-            _shBands = _splatData.ShBands;
-            _shCoeffsPerSplat = _splatData.ShCoeffsPerSplat;
-            Vector3[] shCoeffs = _splatData.ShCoeffs;
+            int count = PlyAsset.Count;
+            Vector3[] centers = PlyAsset.Centers;
+            Vector4[] rotations = PlyAsset.Rotations;
+            Vector3[] scales = PlyAsset.Scales;
+            Vector4[] colors = PlyAsset.Colors;
 
             // Apply MaxSplatsToLoad limit BEFORE creating buffers (affects sorting too)
             if (MaxSplatsToLoad > 0 && MaxSplatsToLoad < count)
@@ -355,178 +399,589 @@ namespace GaussianSplatting
                 Array.Resize(ref rotations, count);
                 Array.Resize(ref scales, count);
                 Array.Resize(ref colors, count);
-                if (shCoeffs != null && shCoeffs.Length > 0)
-                {
-                    Array.Resize(ref shCoeffs, count * _shCoeffsPerSplat);
-                }
             }
 
             _count = count;
-            _visibleCount = _count;
 
             _centersCpu = centers;
             _orderCpu = new uint[_count];
             for (uint i = 0; i < _orderCpu.Length; i++) _orderCpu[i] = i;
-
-            _orderBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.CopyDestination, _count, sizeof(uint));
-            _orderBuffer.SetData(_orderCpu);
-
+            
             // Apply scale multiplier
             for (int i = 0; i < scales.Length; i++)
             {
                 scales[i] = scales[i] * ScaleMultiplier;
             }
 
-            if (_isUsingGLES)
+            // UNIFIED BUFFER LAYOUT: Use packed buffers on ALL platforms
+            // This ensures consistency between Vulkan, Metal, D3D, and GLES
+            // and avoids Vulkan "missing bindings" issues with separate buffers
+            //
+            // OPTIMIZATION: Precompute 3D covariance to avoid per-vertex computation
+            // 3D covariance is a symmetric 3x3 matrix = 6 unique values (xx, xy, xz, yy, yz, zz)
+            //
+            // Packing scheme (4 SSBOs total):
+            // Buffer 0: _SplatOrder (uint) - sort indices (per-camera)
+            // Buffer 1: _SplatPosCovA (float4) - pos.xyz, cov.xx
+            // Buffer 2: _SplatCovB (float4) - cov.xy, cov.xz, cov.yy, cov.yz
+            // Buffer 3: _SplatCovCColor (float4) - cov.zz, unused, packHalf(color.rg), packHalf(color.ba)
+            
+            // Create output buffers (shared across cameras - only order buffer is per-camera)
+            _glesPosScale = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
+            _glesRotation = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
+            _glesColor = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
+            
+            // Choose GPU or CPU path for covariance precomputation
+            bool useGpuPrecompute = SystemInfo.supportsComputeShaders && _count >= GPU_PRECOMPUTE_THRESHOLD;
+            
+            if (useGpuPrecompute)
             {
-                // GLES 3.1 STRICT: Must use only 4 SSBOs total (including order buffer)
-                // OPTIMIZATION: Precompute 3D covariance on CPU to avoid per-vertex computation
-                //
-                // 3D covariance is a symmetric 3x3 matrix = 6 unique values (xx, xy, xz, yy, yz, zz)
-                // This replaces rotation(4) + scale(3) = 7 floats with covariance(6) = 6 floats
-                //
-                // Packing scheme (4 SSBOs total):
-                // Buffer 0: _SplatOrder (uint) - sort indices
-                // Buffer 1: _SplatPosCovA (float4) - pos.xyz, cov.xx
-                // Buffer 2: _SplatCovB (float4) - cov.xy, cov.xz, cov.yy, cov.yz
-                // Buffer 3: _SplatCovCColor (float4) - cov.zz, unused, packHalf(color.rg), packHalf(color.ba)
-
-                Vector4[] posCovA = new Vector4[_count];
-                Vector4[] covB = new Vector4[_count];
-                Vector4[] covCColor = new Vector4[_count];
-
-                for (int i = 0; i < _count; i++)
-                {
-                    // Precompute 3D covariance from rotation and scale
-                    ComputeCovariance3D(rotations[i], scales[i], out Vector3 covA, out Vector3 covBVec);
-
-                    posCovA[i] = new Vector4(centers[i].x, centers[i].y, centers[i].z, covA.x);
-                    covB[i] = new Vector4(covA.y, covA.z, covBVec.x, covBVec.y);
-
-                    // Pack color RGBA into 2 floats using half precision
-                    uint colorRG = PackHalf2x16(colors[i].x, colors[i].y);
-                    uint colorBA = PackHalf2x16(colors[i].z, colors[i].w);
-                    covCColor[i] = new Vector4(covBVec.z, 0f,
-                        BitConverter.Int32BitsToSingle((int)colorRG),
-                        BitConverter.Int32BitsToSingle((int)colorBA));
-                }
-
-                _glesPosScale = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
-                _glesRotation = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
-                _glesColor = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
-
-                _glesPosScale.SetData(posCovA);
-                _glesRotation.SetData(covB);
-                _glesColor.SetData(covCColor);
-
-                _activeMaterial.SetBuffer("_SplatOrder", _orderBuffer);
-                _activeMaterial.SetBuffer("_SplatPosCovA", _glesPosScale);
-                _activeMaterial.SetBuffer("_SplatCovB", _glesRotation);
-                _activeMaterial.SetBuffer("_SplatCovCColor", _glesColor);
+                // GPU path: ~30x faster on mobile/Quest for large splat counts
+                PrecomputeCovarianceGPU(centers, rotations, scales, colors);
             }
             else
             {
-                // Standard path: Separate buffers (5+ SSBOs OK on Vulkan/Metal/D3D)
-                _centersBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 3);
-                _rotationsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
-                _scalesBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 3);
-                _colorsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
-
-                _centersBuffer.SetData(centers);
-                _rotationsBuffer.SetData(rotations);
-                _scalesBuffer.SetData(scales);
-                _colorsBuffer.SetData(colors);
-
-                // Set up SH coefficients (not supported in GLES mode)
-                if (_shBands > 0 && _shCoeffsPerSplat > 0 && shCoeffs != null && shCoeffs.Length == _count * _shCoeffsPerSplat)
-                {
-                    _shCoeffsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, shCoeffs.Length, sizeof(float) * 3);
-                    _shCoeffsBuffer.SetData(shCoeffs);
-                    _activeMaterial.SetBuffer("_SHCoeffs", _shCoeffsBuffer);
-                }
-
-                _activeMaterial.SetBuffer("_SplatOrder", _orderBuffer);
-                _activeMaterial.SetBuffer("_Centers", _centersBuffer);
-                _activeMaterial.SetBuffer("_Rotations", _rotationsBuffer);
-                _activeMaterial.SetBuffer("_Scales", _scalesBuffer);
-                _activeMaterial.SetBuffer("_Colors", _colorsBuffer);
+                // CPU path: better for small splat counts or platforms without compute
+                PrecomputeCovarianceCPU(centers, rotations, scales, colors);
             }
-
-            _lastCamPos = new Vector3(float.NaN, 0, 0);
-            _lastCamDir = new Vector3(float.NaN, 0, 0);
 
             _localBounds = ComputeLocalBounds(_centersCpu);
             _worldBounds = TransformBounds(_localBounds, transform.localToWorldMatrix);
 
-            // Create GPU sorter - choose based on graphics API capability
-            // OpenGL ES doesn't support wave intrinsics, so use GLES-compatible sorter
-            bool useGLESSorter = _isUsingGLES || !SystemInfo.supportsComputeShaders;
+            // Per-camera sorters and order buffers are created on-demand in GetOrCreateCameraState()
+            // This allows Scene View and Game View to have independent sorting/culling
+            
+            // Reset frame counter to ensure first frame sorts
+            _frameCounter = 0;
+            
+            Debug.Log($"[GaussianSplatRenderer] TryLoad: completed! GPU buffers created for {_count} splats. Material={_activeMaterial.name}");
+            Debug.Log($"[GaussianSplatRenderer] Local bounds: center={_localBounds.center}, size={_localBounds.size}");
+            Debug.Log($"[GaussianSplatRenderer] World bounds: center={_worldBounds.center}, size={_worldBounds.size}");
+            Debug.Log($"[GaussianSplatRenderer] Transform position: {transform.position}, rotation: {transform.rotation.eulerAngles}, scale: {transform.lossyScale}");
+        }
 
-            if (useGLESSorter)
+        /// <summary>
+        /// Set splat data from a GaussianSplatData object (plain C# class).
+        /// This allows external loaders to provide data without using ScriptableObjects.
+        /// </summary>
+        public void SetSplatData(GaussianSplatData data)
+        {
+            if (data == null || data.Count == 0)
             {
-                if (SortingAlgorithm == SortAlgorithm.None)
-                {
-                    // No sorter needed, identity order will be used
-                }
-                else if (SortingAlgorithm == SortAlgorithm.Bitonic)
-                {
-                    var sortShaderBitonic = Resources.Load<ComputeShader>("GaussianSplatBitonicSort");
-                    if (sortShaderBitonic != null)
-                    {
-                        _gpuSorterBitonic = new GaussianSplatBitonicSorter(sortShaderBitonic, _count);
-                    }
-                    else
-                    {
-                        SortingAlgorithm = SortAlgorithm.Radix;
-                    }
-                }
+                Debug.LogWarning("[GaussianSplatRenderer] SetSplatData: data is null or empty");
+                return;
+            }
 
-                if (SortingAlgorithm == SortAlgorithm.Radix)
+            if (Material == null)
+            {
+                Debug.LogWarning("[GaussianSplatRenderer] SetSplatData: Material is null");
+                return;
+            }
+
+            _activeMaterial = Material;
+            Release();
+
+            int count = data.Count;
+            Vector3[] centers = data.Centers;
+            Vector4[] rotations = data.Rotations;
+            Vector3[] scales = data.Scales;
+            Vector4[] colors = data.Colors;
+
+            if (MaxSplatsToLoad > 0 && MaxSplatsToLoad < count)
+            {
+                count = MaxSplatsToLoad;
+                Array.Resize(ref centers, count);
+                Array.Resize(ref rotations, count);
+                Array.Resize(ref scales, count);
+                Array.Resize(ref colors, count);
+            }
+
+            _count = count;
+            _centersCpu = centers;
+            _orderCpu = new uint[_count];
+            for (uint i = 0; i < _orderCpu.Length; i++) _orderCpu[i] = i;
+
+            for (int i = 0; i < scales.Length; i++)
+            {
+                scales[i] = scales[i] * ScaleMultiplier;
+            }
+
+            _glesPosScale = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
+            _glesRotation = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
+            _glesColor = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
+
+            bool useGpuPrecompute = SystemInfo.supportsComputeShaders && _count >= GPU_PRECOMPUTE_THRESHOLD;
+
+            if (useGpuPrecompute)
+            {
+                PrecomputeCovarianceGPU(centers, rotations, scales, colors);
+            }
+            else
+            {
+                PrecomputeCovarianceCPU(centers, rotations, scales, colors);
+            }
+
+            _localBounds = ComputeLocalBounds(_centersCpu);
+            _worldBounds = TransformBounds(_localBounds, transform.localToWorldMatrix);
+            _frameCounter = 0;
+
+            Debug.Log($"[GaussianSplatRenderer] SetSplatData: loaded {_count} splats");
+        }
+
+        public bool IsLoaded => _count > 0 && _glesPosScale != null;
+        public int SplatCount => _count;
+
+        /// <summary>
+        /// Get or create per-camera rendering state (order buffer, sorter, visible count).
+        /// This allows Scene View and Game View to have independent sorting and frustum culling.
+        /// </summary>
+        private CameraRenderState GetOrCreateCameraState(Camera camera)
+        {
+            if (_cameraStates.TryGetValue(camera, out var state))
+            {
+                state.LastFrameUsed = Time.frameCount;
+                return state;
+            }
+            
+            // Create new state for this camera
+            state = new CameraRenderState
+            {
+                OrderBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.CopyDestination, _count, sizeof(uint)),
+                VisibleCount = _count,
+                LastFrameUsed = Time.frameCount
+            };
+            
+            // Initialize order buffer with identity
+            state.OrderBuffer.SetData(_orderCpu);
+            
+            // Create sorter based on algorithm preference
+            if (SortingAlgorithm == SortAlgorithm.Bitonic)
+            {
+                var sortShader = Resources.Load<ComputeShader>("GaussianSplatBitonicSort");
+                if (sortShader != null)
                 {
-                    var sortShaderGLES = Resources.Load<ComputeShader>("GaussianSplatSortGLES");
-                    if (sortShaderGLES != null)
+                    state.BitonicSorter = new GaussianSplatBitonicSorter(sortShader, _count);
+                }
+            }
+            else if (SortingAlgorithm == SortAlgorithm.Radix)
+            {
+                var sortShader = Resources.Load<ComputeShader>("GaussianSplatRadixSort");
+                if (sortShader != null)
+                {
+                    state.RadixSorter = new GaussianSplatRadixSorter(sortShader, _count);
+                }
+            }
+            
+            _cameraStates[camera] = state;
+            Debug.Log($"[GaussianSplatRenderer] Created per-camera state for '{camera.name}' (type: {camera.cameraType})");
+            
+            // Clean up old unused camera states
+            CleanupUnusedCameraStates();
+            
+            return state;
+        }
+        
+        /// <summary>
+        /// Remove camera states that haven't been used recently (e.g., closed Scene Views).
+        /// </summary>
+        private void CleanupUnusedCameraStates()
+        {
+            var toRemove = new List<Camera>();
+            int currentFrame = Time.frameCount;
+            
+            foreach (var kvp in _cameraStates)
+            {
+                // Remove if camera is null (destroyed) or hasn't been used recently
+                if (kvp.Key == null || (currentFrame - kvp.Value.LastFrameUsed) > CAMERA_STATE_EXPIRY_FRAMES)
+                {
+                    kvp.Value.Dispose();
+                    toRemove.Add(kvp.Key);
+                }
+            }
+            
+            foreach (var cam in toRemove)
+            {
+                _cameraStates.Remove(cam);
+                Debug.Log($"[GaussianSplatRenderer] Cleaned up unused camera state");
+            }
+        }
+
+        /// <summary>
+        /// Initialize mesh-based deformation for Gaussian splats.
+        /// Call this after the Gaussian data is loaded to enable mesh deformation.
+        /// </summary>
+        /// <param name="mappings">Gaussian to face mappings (use GaussianFaceMapping struct)</param>
+        /// <param name="vertices">Original mesh vertices (rest pose)</param>
+        /// <param name="triangles">Mesh triangle indices (3 per face)</param>
+        /// <returns>True if initialization succeeded</returns>
+        public bool InitializeMeshDeformation(GaussianFaceMapping[] mappings,
+                                               Vector3[] vertices, int[] triangles)
+        {
+            if (_count == 0 || _glesPosScale == null)
+            {
+                Debug.LogError("[GaussianSplatRenderer] Cannot initialize mesh deformation - Gaussians not loaded");
+                return false;
+            }
+            
+            if (mappings.Length != _count)
+            {
+                Debug.LogError($"[GaussianSplatRenderer] Mapping count ({mappings.Length}) doesn't match Gaussian count ({_count})");
+                return false;
+            }
+            
+            int faceCount = triangles.Length / 3;
+            
+            // Load compute shader
+            var deformShader = Resources.Load<ComputeShader>("GaussianMeshDeform");
+            if (deformShader == null)
+            {
+                Debug.LogError("[GaussianSplatRenderer] Could not load GaussianMeshDeform compute shader");
+                return false;
+            }
+            
+            // Dispose existing deformer if any
+            _meshDeformer?.Dispose();
+            
+            // Create new deformer
+            _meshDeformer = new GaussianMeshDeformer(deformShader, _count, faceCount);
+            _meshDeformer.Initialize(mappings, vertices, triangles);
+            
+            // Store original covariance data for proper rotation
+            _meshDeformer.StoreOriginalCovariances(_glesPosScale, _glesRotation, _glesColor);
+            
+            Debug.Log($"[GaussianSplatRenderer] Mesh deformation initialized for {_count} Gaussians, {faceCount} faces");
+            return true;
+        }
+
+        /// <summary>
+        /// Update the mesh state for deformation. Call this when the mesh has been deformed.
+        /// </summary>
+        /// <param name="vertices">Current deformed mesh vertices</param>
+        /// <param name="triangles">Mesh triangle indices (unchanged from original)</param>
+        public void UpdateMeshDeformation(Vector3[] vertices, int[] triangles)
+        {
+            if (_meshDeformer == null || !_meshDeformer.IsInitialized)
+            {
+                Debug.LogWarning("[GaussianSplatRenderer] Mesh deformation not initialized");
+                return;
+            }
+            
+            _meshDeformer.UpdateMeshState(vertices, triangles);
+        }
+
+        /// <summary>
+        /// Whether mesh deformation is enabled and initialized.
+        /// </summary>
+        public bool IsMeshDeformationEnabled => _meshDeformer != null && _meshDeformer.IsInitialized;
+
+        /// <summary>
+        /// Get the position buffer for external access (e.g., for custom deformation).
+        /// </summary>
+        public GraphicsBuffer PositionBuffer => _glesPosScale;
+
+        /// <summary>
+        /// GPU compute shader path for covariance precomputation.
+        /// ~30x faster than CPU on mobile/Quest for large splat counts.
+        /// </summary>
+        private void PrecomputeCovarianceGPU(Vector3[] centers, Vector4[] rotations, Vector3[] scales, Vector4[] colors)
+        {
+            var stopwatch = new System.Diagnostics.Stopwatch();
+            stopwatch.Start();
+            
+            // Load compute shader if not already loaded
+            if (_precomputeShader == null)
+            {
+                _precomputeShader = Resources.Load<ComputeShader>("GaussianSplatPrecompute");
+                if (_precomputeShader == null)
+                {
+                    Debug.LogWarning("[GaussianSplatRenderer] Could not load GaussianSplatPrecompute compute shader. Falling back to CPU.");
+                    PrecomputeCovarianceCPU(centers, rotations, scales, colors);
+                    return;
+                }
+                _precomputeKernel = _precomputeShader.FindKernel("CSPrecomputeCovariance");
+            }
+            
+            // Create temporary input buffers
+            var centersBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 3);
+            var rotationsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
+            var scalesBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 3);
+            var colorsBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, _count, sizeof(float) * 4);
+            
+            // Upload input data
+            centersBuffer.SetData(centers);
+            rotationsBuffer.SetData(rotations);
+            scalesBuffer.SetData(scales);
+            colorsBuffer.SetData(colors);
+            
+            // Bind buffers to compute shader
+            _precomputeShader.SetBuffer(_precomputeKernel, "_Centers", centersBuffer);
+            _precomputeShader.SetBuffer(_precomputeKernel, "_Rotations", rotationsBuffer);
+            _precomputeShader.SetBuffer(_precomputeKernel, "_Scales", scalesBuffer);
+            _precomputeShader.SetBuffer(_precomputeKernel, "_Colors", colorsBuffer);
+            _precomputeShader.SetBuffer(_precomputeKernel, "_OutPosCovA", _glesPosScale);
+            _precomputeShader.SetBuffer(_precomputeKernel, "_OutCovB", _glesRotation);
+            _precomputeShader.SetBuffer(_precomputeKernel, "_OutCovCColor", _glesColor);
+            _precomputeShader.SetInt("_SplatCount", _count);
+            
+            // Dispatch compute shader (256 threads per group)
+            int threadGroups = (_count + 255) / 256;
+            _precomputeShader.Dispatch(_precomputeKernel, threadGroups, 1, 1);
+            
+            // Release temporary input buffers
+            centersBuffer.Release();
+            rotationsBuffer.Release();
+            scalesBuffer.Release();
+            colorsBuffer.Release();
+            
+            stopwatch.Stop();
+            Debug.Log($"[GaussianSplatRenderer] GPU covariance precompute: {_count} splats in {stopwatch.ElapsedMilliseconds}ms ({threadGroups} thread groups)");
+        }
+
+        /// <summary>
+        /// CPU path for covariance precomputation.
+        /// Used for small splat counts or platforms without compute shader support.
+        /// </summary>
+        private void PrecomputeCovarianceCPU(Vector3[] centers, Vector4[] rotations, Vector3[] scales, Vector4[] colors)
+        {
+            var stopwatch = new System.Diagnostics.Stopwatch();
+            stopwatch.Start();
+            
+            Vector4[] posCovA = new Vector4[_count];
+            Vector4[] covB = new Vector4[_count];
+            Vector4[] covCColor = new Vector4[_count];
+            
+            for (int i = 0; i < _count; i++)
+            {
+                // Precompute 3D covariance from rotation and scale
+                ComputeCovariance3D(rotations[i], scales[i], out Vector3 covA, out Vector3 covBVec);
+                
+                posCovA[i] = new Vector4(centers[i].x, centers[i].y, centers[i].z, covA.x);
+                covB[i] = new Vector4(covA.y, covA.z, covBVec.x, covBVec.y);
+                
+                // Pack color RGBA into 2 floats using half precision
+                uint colorRG = PackHalf2x16(colors[i].x, colors[i].y);
+                uint colorBA = PackHalf2x16(colors[i].z, colors[i].w);
+                covCColor[i] = new Vector4(covBVec.z, 0f, 
+                    BitConverter.Int32BitsToSingle((int)colorRG),
+                    BitConverter.Int32BitsToSingle((int)colorBA));
+            }
+            
+            _glesPosScale.SetData(posCovA);
+            _glesRotation.SetData(covB);
+            _glesColor.SetData(covCColor);
+            
+            stopwatch.Stop();
+            Debug.Log($"[GaussianSplatRenderer] CPU covariance precompute: {_count} splats in {stopwatch.ElapsedMilliseconds}ms");
+        }
+
+        private IEnumerator LoadPlyRuntime()
+        {
+            Debug.Log($"[GaussianSplatRenderer] LoadPlyRuntime coroutine started");
+            
+            // Check if component still exists (might be destroyed when exiting Play mode)
+            if (this == null)
+            {
+                Debug.LogWarning("[GaussianSplatRenderer] Component was destroyed, cancelling PLY load");
+                yield break;
+            }
+            
+            string source = GetCurrentSource();
+            if (string.IsNullOrEmpty(source))
+            {
+                Debug.LogError("[GaussianSplatRenderer] Both PlyUrl and PlyFileName are empty. Cannot load PLY.");
+                yield break;
+            }
+
+            string loadPath;
+            bool isUrl = !string.IsNullOrEmpty(PlyUrl);
+            
+            if (isUrl)
+            {
+                loadPath = PlyUrl;
+                // Check URL extension early to provide better error message
+                string urlExtension = Path.GetExtension(loadPath).ToLower();
+                if (!string.IsNullOrEmpty(urlExtension) && urlExtension != ".ply")
+                {
+                    Debug.LogWarning($"[GaussianSplatRenderer] URL has extension '{urlExtension}' but expected '.ply'. Gaussian Splatting requires PLY files. The file may not load correctly.");
+                }
+                Debug.Log($"[GaussianSplatRenderer] Loading PLY from URL: {loadPath}");
+            }
+            else
+            {
+                loadPath = Path.Combine(Application.streamingAssetsPath, "GaussianSplatting", PlyFileName);
+                Debug.Log($"[GaussianSplatRenderer] Loading PLY from StreamingAssets: {loadPath}");
+            }
+            
+            Debug.Log($"[GaussianSplatRenderer] Platform: {Application.platform}, path contains '://': {loadPath.Contains("://")}");
+
+            byte[] fileBytes = null;
+
+            // Use UnityWebRequest for URLs or StreamingAssets on platforms that need it
+            if (isUrl || loadPath.Contains("://") || Application.platform == RuntimePlatform.Android)
+            {
+                Debug.Log($"[GaussianSplatRenderer] Using UnityWebRequest");
+                using (UnityWebRequest uwr = UnityWebRequest.Get(loadPath))
+                {
+                    yield return uwr.SendWebRequest();
+
+                    if (uwr.result == UnityWebRequest.Result.ConnectionError || 
+                        uwr.result == UnityWebRequest.Result.ProtocolError)
                     {
-                        _gpuSorterGLES = new GaussianSplatGPUSorterGLES(sortShaderGLES, _count);
+                        Debug.LogError($"[GaussianSplatRenderer] Error loading PLY: {uwr.error}");
+                        yield break;
                     }
+
+                    fileBytes = uwr.downloadHandler.data;
+                    Debug.Log($"[GaussianSplatRenderer] UnityWebRequest completed, received {fileBytes?.Length ?? 0} bytes");
                 }
             }
             else
             {
-                var sortShader = Resources.Load<ComputeShader>("GaussianSplatSort");
-                if (sortShader != null)
+                // For Editor and Standalone desktop builds with local files
+                Debug.Log($"[GaussianSplatRenderer] Using File.ReadAllBytes");
+                if (!File.Exists(loadPath))
                 {
-                    _gpuSorter = new GaussianSplatGPUSorter(sortShader, _count);
+                    Debug.LogError($"[GaussianSplatRenderer] PLY file not found: {loadPath}");
+                    yield break;
+                }
+
+                try
+                {
+                    fileBytes = File.ReadAllBytes(loadPath);
+                    Debug.Log($"[GaussianSplatRenderer] Read {fileBytes.Length} bytes from file");
+                }
+                catch (System.Exception ex)
+                {
+                    Debug.LogError($"[GaussianSplatRenderer] Error reading PLY file: {ex.Message}");
+                    yield break;
                 }
             }
 
-            // Reset frame counter to ensure first frame sorts
-            _frameCounter = 0;
+            if (fileBytes == null || fileBytes.Length == 0)
+            {
+                Debug.LogError("[GaussianSplatRenderer] PLY file is empty");
+                yield break;
+            }
+
+            // Validate file format - check if it's actually a PLY file
+            if (fileBytes.Length < 3)
+            {
+                Debug.LogError("[GaussianSplatRenderer] File is too small to be a valid PLY file");
+                yield break;
+            }
+
+            // Check PLY header magic bytes (PLY files start with "ply")
+            string headerStart = Encoding.ASCII.GetString(fileBytes, 0, Math.Min(3, fileBytes.Length));
+            if (!headerStart.Equals("ply", StringComparison.OrdinalIgnoreCase))
+            {
+                string fileExtension = isUrl ? Path.GetExtension(loadPath).ToLower() : Path.GetExtension(PlyFileName).ToLower();
+                Debug.LogError($"[GaussianSplatRenderer] File is not a PLY file. File extension: '{fileExtension}'. PLY files must start with 'ply' header. The URL/file may point to a different file format (e.g., .glb, .obj, .fbx). Please use a .ply file containing Gaussian Splat data.");
+                yield break;
+            }
+
+            Debug.Log($"[GaussianSplatRenderer] Loaded {fileBytes.Length} bytes, parsing PLY...");
+
+            // Check if component still exists before parsing
+            if (this == null)
+            {
+                Debug.LogWarning("[GaussianSplatRenderer] Component was destroyed during download, cancelling PLY load");
+                yield break;
+            }
+
+            // Parse PLY data (always use RightHandedToUnity conversion)
+            PlyGaussianSplat plyData = null;
+            try
+            {
+                plyData = PlyGaussianSplatLoader.Load(fileBytes, CoordinateConversion.RightHandedToUnity);
+                Debug.Log($"[GaussianSplatRenderer] PLY parsed successfully: {plyData.Count} splats");
+            }
+            catch (System.Exception ex)
+            {
+                Debug.LogError($"[GaussianSplatRenderer] Error parsing PLY: {ex.Message}\n{ex.StackTrace}");
+                yield break;
+            }
+
+            if (plyData == null || plyData.Count == 0)
+            {
+                Debug.LogError("[GaussianSplatRenderer] PLY file contains no splats");
+                yield break;
+            }
+
+            // Check again if component still exists before creating asset
+            if (this == null)
+            {
+                Debug.LogWarning("[GaussianSplatRenderer] Component was destroyed during PLY parsing, cancelling asset creation");
+                yield break;
+            }
+
+            Debug.Log($"[GaussianSplatRenderer] Creating ScriptableObject asset...");
+            
+            // Create runtime asset
+            var asset = ScriptableObject.CreateInstance<GaussianSplatAsset>();
+            string assetName = isUrl ? "url_splat" : Path.GetFileNameWithoutExtension(PlyFileName);
+            asset.name = assetName;
+            asset.Count = plyData.Count;
+            asset.Centers = plyData.Centers;
+            asset.Rotations = plyData.Rotations;
+            asset.Scales = plyData.Scales;
+            asset.Colors = plyData.Colors;
+            asset.ShBands = plyData.ShBands;
+            asset.ShCoeffsPerSplat = plyData.ShCoeffsPerSplat;
+            asset.ShCoeffs = plyData.ShCoeffs;
+
+            PlyAsset = asset;
+            _lastLoadedSource = source;
+            Debug.Log($"[GaussianSplatRenderer] Successfully loaded from '{source}' with {plyData.Count} splats");
+
+            // Now load the asset into GPU buffers
+            Debug.Log($"[GaussianSplatRenderer] Calling TryLoad to create GPU buffers...");
+            TryLoad();
+            Debug.Log($"[GaussianSplatRenderer] LoadPlyRuntime coroutine completed");
         }
 
         private void BeginCameraRendering(ScriptableRenderContext context, Camera camera)
         {
-            if (_splatData == null) return;
-
             // Skip if using render feature (it will call RenderWithCommandBuffer instead)
             if (UseRenderFeature && GraphicsSettings.currentRenderPipeline != null)
             {
                 return;
             }
-
+            
             // Lazy reload if data was released (e.g., after scene save in editor)
-            if ((_needsReload || _orderBuffer == null) && _splatData != null && Material != null)
-                LoadToGPU();
-
-            if (!enabled || _activeMaterial == null || _orderBuffer == null || _count == 0)
+            if ((_needsReload || _glesPosScale == null) && PlyAsset != null && Material != null)
+                TryLoad();
+            
+            if (!enabled)
+            {
+                Debug.Log($"[GaussianSplatRenderer] Skipping render - component disabled. Camera: {camera.name}");
                 return;
-
+            }
+            if (_activeMaterial == null)
+            {
+                Debug.LogWarning($"[GaussianSplatRenderer] Skipping render - Material is null. Camera: {camera.name}");
+                return;
+            }
+            if (_glesPosScale == null)
+            {
+                Debug.LogWarning($"[GaussianSplatRenderer] Skipping render - GPU buffers not initialized. Camera: {camera.name}");
+                return;
+            }
+            if (_count == 0)
+            {
+                Debug.LogWarning($"[GaussianSplatRenderer] Skipping render - no splats loaded. Camera: {camera.name}");
+                return;
+            }
+            
             // Scene view handling - always draw
             if (camera.cameraType != CameraType.SceneView)
             {
                 // For non-scene cameras, filter by TargetCamera
                 var cam = TargetCamera != null ? TargetCamera : Camera.main;
                 if (cam != null && camera != cam)
+                {
+                    Debug.Log($"[GaussianSplatRenderer] Skipping render - camera mismatch. Target: {cam?.name}, Current: {camera.name}");
                     return;
+                }
             }
 
             RenderForCamera(camera, (CommandBuffer)null);
@@ -536,10 +991,11 @@ namespace GaussianSplatting
         {
             // Built-in RP fallback
             if (GraphicsSettings.currentRenderPipeline != null) return;
-            if (!enabled || _activeMaterial == null || _orderBuffer == null || _count == 0) return;
+            if (!enabled || _activeMaterial == null || _glesPosScale == null || _count == 0) return;
 
             var camera = Camera.current;
             if (camera == null) return;
+            // Always render in scene view
 
             var cam = TargetCamera != null ? TargetCamera : Camera.main;
             if (cam != null && camera != cam) return;
@@ -553,11 +1009,11 @@ namespace GaussianSplatting
         public void RenderWithCommandBuffer(CommandBuffer cmd, Camera camera)
         {
             // Lazy reload if data was released (e.g., after scene save in editor)
-            if ((_needsReload || _orderBuffer == null) && _splatData != null && Material != null)
-                LoadToGPU();
-
-            if (!enabled || _activeMaterial == null || _orderBuffer == null || _count == 0) return;
-
+            if ((_needsReload || _glesPosScale == null) && PlyAsset != null && Material != null)
+                TryLoad();
+            
+            if (!enabled || _activeMaterial == null || _glesPosScale == null || _count == 0) return;
+            
             // Scene view handling - always draw
             if (camera.cameraType != CameraType.SceneView)
             {
@@ -575,11 +1031,11 @@ namespace GaussianSplatting
         public void RenderWithRasterCommandBuffer(RasterCommandBuffer cmd, Camera camera)
         {
             // Lazy reload if data was released (e.g., after scene save in editor)
-            if ((_needsReload || _orderBuffer == null) && _splatData != null && Material != null)
-                LoadToGPU();
-
-            if (!enabled || _activeMaterial == null || _orderBuffer == null || _count == 0) return;
-
+            if ((_needsReload || _glesPosScale == null) && PlyAsset != null && Material != null)
+                TryLoad();
+            
+            if (!enabled || _activeMaterial == null || _glesPosScale == null || _count == 0) return;
+            
             // Scene view handling - always draw
             if (camera.cameraType != CameraType.SceneView)
             {
@@ -597,91 +1053,98 @@ namespace GaussianSplatting
             if (!_firstRenderLogged)
             {
                 _firstRenderLogged = true;
-                Debug.Log($"[GS-PERF] First render! Camera={camera.name}, visible={_visibleCount}/{_count}, GLES={_isUsingGLES}");
+                Debug.Log($"[GS-PERF] First render call! Camera={camera.name}, UseRenderFeature={UseRenderFeature}, cmd={(cmd != null ? "CommandBuffer" : "null")}");
             }
-
+            
+            // Get or create per-camera state (each camera gets its own order buffer, sorter, and visible count)
+            var camState = GetOrCreateCameraState(camera);
+            
             // Track frame time
             float currentTime = Time.realtimeSinceStartup;
             float frameTime = (currentTime - _lastFrameTime) * 1000f;
             _lastFrameTime = currentTime;
             _avgFrameTimeMs = Mathf.Lerp(_avgFrameTimeMs, frameTime, 0.1f);
-
+            
             // Sort based on frame frequency
             _frameCounter++;
             bool shouldSort = (_frameCounter % SortEveryNFrames) == 0;
-
+            
             if (shouldSort)
             {
                 _sortStopwatch.Restart();
-
+                
+                // Apply mesh deformation BEFORE sorting (if enabled)
+                // Note: This modifies the shared position buffer, which is fine since all cameras see the same deformed mesh
+                if (_meshDeformer != null && _meshDeformer.IsInitialized)
+                {
+                    _meshDeformer.ApplyDeformation(_glesPosScale, _glesRotation, _glesColor);
+                }
+                
                 // transform camera into object space (matches gsplat-instance.js sort path)
                 var camPosOS = transform.InverseTransformPoint(camera.transform.position);
                 var camDirOS = transform.InverseTransformDirection(camera.transform.forward).normalized;
 
-                if (SortingAlgorithm == SortAlgorithm.None && _isUsingGLES)
+                if (SortingAlgorithm == SortAlgorithm.None)
                 {
                     // No sorting - use identity order (fastest, may have visual artifacts)
-                    _visibleCount = _count;
+                    camState.VisibleCount = _count;
                 }
-                else if (_gpuSorterBitonic != null)
+                else if (camState.BitonicSorter != null)
                 {
-                    // Bitonic sort path
+                    // Bitonic sort path (per-camera sorter)
                     Matrix4x4 sortModelMatrix = transform.localToWorldMatrix;
                     Matrix4x4 sortViewMatrix = camera.worldToCameraMatrix;
                     Matrix4x4 modelViewMatrix = sortViewMatrix * sortModelMatrix;
-
+                    
                     if (EnableFrustumCulling)
                     {
                         Matrix4x4 viewProjMatrix = camera.projectionMatrix * sortViewMatrix * sortModelMatrix;
-                        if (_gpuSorterBitonic.Sort(_glesPosScale, _orderBuffer, modelViewMatrix, viewProjMatrix, camPosOS, camDirOS, FrustumCullMargin, out int visible))
+                        if (camState.BitonicSorter.Sort(_glesPosScale, camState.OrderBuffer, modelViewMatrix, viewProjMatrix, camPosOS, camDirOS, FrustumCullMargin, out int visible))
                         {
-                            _visibleCount = visible;
+                            camState.VisibleCount = visible;
                         }
                     }
                     else
                     {
-                        _gpuSorterBitonic.Sort(_glesPosScale, _orderBuffer, modelViewMatrix, camPosOS, camDirOS);
-                        _visibleCount = _count;
+                        camState.BitonicSorter.Sort(_glesPosScale, camState.OrderBuffer, modelViewMatrix, camPosOS, camDirOS);
+                        camState.VisibleCount = _count;
                     }
                 }
-                else if (_gpuSorterGLES != null)
+                else if (camState.RadixSorter != null)
                 {
-                    // Radix sort path
+                    // Radix sort path (per-camera sorter)
                     Matrix4x4 sortModelMatrix = transform.localToWorldMatrix;
                     Matrix4x4 sortViewMatrix = camera.worldToCameraMatrix;
                     Matrix4x4 modelViewMatrix = sortViewMatrix * sortModelMatrix;
-
+                    
                     if (EnableFrustumCulling)
                     {
                         Matrix4x4 viewProjMatrix = camera.projectionMatrix * sortViewMatrix * sortModelMatrix;
-                        if (_gpuSorterGLES.Sort(_glesPosScale, _orderBuffer, modelViewMatrix, viewProjMatrix, camPosOS, camDirOS, FrustumCullMargin, out int visible))
+                        if (camState.RadixSorter.Sort(_glesPosScale, camState.OrderBuffer, modelViewMatrix, viewProjMatrix, camPosOS, camDirOS, FrustumCullMargin, out int visible))
                         {
-                            _visibleCount = visible;
+                            camState.VisibleCount = visible;
                         }
                     }
                     else
                     {
-                        _gpuSorterGLES.Sort(_glesPosScale, _orderBuffer, modelViewMatrix, camPosOS, camDirOS);
-                        _visibleCount = _count;
+                        camState.RadixSorter.Sort(_glesPosScale, camState.OrderBuffer, modelViewMatrix, camPosOS, camDirOS);
+                        camState.VisibleCount = _count;
                     }
-                }
-                else if (_gpuSorter != null)
-                {
-                    // Standard GPU sorter (wave intrinsics)
-                    Matrix4x4 sortModelMatrix = transform.localToWorldMatrix;
-                    Matrix4x4 sortViewMatrix = camera.worldToCameraMatrix;
-                    Matrix4x4 modelViewMatrix = sortViewMatrix * sortModelMatrix;
-                    _gpuSorter.Sort(_centersBuffer, _orderBuffer, modelViewMatrix, camPosOS, camDirOS);
-                    _visibleCount = _count;
                 }
                 // No CPU fallback - if no GPU sorter, identity order is used
-
+                
                 _sortStopwatch.Stop();
                 _lastSortTimeMs = (float)_sortStopwatch.Elapsed.TotalMilliseconds;
                 _avgSortTimeMs = Mathf.Lerp(_avgSortTimeMs, _lastSortTimeMs, 0.1f);
             }
-
-            // Performance logging
+            
+            // Always draw all splats - culled ones are sorted to the end with max key
+            // and will be clipped by the GPU. This avoids flickering from async visible count latency.
+            // The VisibleCount is still tracked for performance logging purposes.
+            int visibleCount = _count;
+            int reportedVisible = camState.VisibleCount > 0 ? camState.VisibleCount : _count;
+            
+            // Performance logging (CommandBuffer path)
             if (LogPerformanceEveryNFrames > 0)
             {
                 _perfLogCounter++;
@@ -689,8 +1152,8 @@ namespace GaussianSplatting
                 {
                     _perfLogCounter = 0;
                     float fps = _avgFrameTimeMs > 0 ? 1000f / _avgFrameTimeMs : 0;
-                    float cullPercent = _count > 0 ? (1f - (float)_visibleCount / _count) * 100f : 0;
-                    Debug.Log($"[GS-PERF] FPS: {fps:F1} | Frame: {_avgFrameTimeMs:F1}ms | Sort: {_avgSortTimeMs:F2}ms | Visible: {_visibleCount}/{_count} ({cullPercent:F0}% culled) | Vertices: {_visibleCount * 6}");
+                    float cullPercent = _count > 0 ? (1f - (float)reportedVisible / _count) * 100f : 0;
+                    Debug.Log($"[GS-PERF] FPS: {fps:F1} | Frame: {_avgFrameTimeMs:F1}ms | Sort: {_avgSortTimeMs:F2}ms | Visible: {reportedVisible}/{_count} ({cullPercent:F0}% culled) | Vertices: {visibleCount * 6}");
                 }
             }
 
@@ -698,23 +1161,12 @@ namespace GaussianSplatting
             float h = camera.pixelHeight;
             var viewportSize = new Vector4(w, h, 1f / Mathf.Max(1f, w), 1f / Mathf.Max(1f, h));
 
-            // Ensure buffers are bound (may be lost after scene save/reload)
-            _activeMaterial.SetBuffer("_SplatOrder", _orderBuffer);
-            if (_isUsingGLES)
-            {
-                _activeMaterial.SetBuffer("_SplatPosCovA", _glesPosScale);
-                _activeMaterial.SetBuffer("_SplatCovB", _glesRotation);
-                _activeMaterial.SetBuffer("_SplatCovCColor", _glesColor);
-            }
-            else
-            {
-                _activeMaterial.SetBuffer("_Centers", _centersBuffer);
-                _activeMaterial.SetBuffer("_Rotations", _rotationsBuffer);
-                _activeMaterial.SetBuffer("_Scales", _scalesBuffer);
-                _activeMaterial.SetBuffer("_Colors", _colorsBuffer);
-                if (_shCoeffsBuffer != null)
-                    _activeMaterial.SetBuffer("_SHCoeffs", _shCoeffsBuffer);
-            }
+
+            // Ensure buffers are bound - use per-camera order buffer
+            _activeMaterial.SetBuffer("_SplatOrder", camState.OrderBuffer);
+            _activeMaterial.SetBuffer("_SplatPosCovA", _glesPosScale);
+            _activeMaterial.SetBuffer("_SplatCovB", _glesRotation);
+            _activeMaterial.SetBuffer("_SplatCovCColor", _glesColor);
 
             if (cmd != null)
             {
@@ -723,9 +1175,7 @@ namespace GaussianSplatting
                 _mpb.Clear();
                 _mpb.SetVector("_ViewportSize", viewportSize);
                 _mpb.SetFloat("_IsOrtho", camera.orthographic ? 1f : 0f);
-                _mpb.SetInt("_NumSplats", _visibleCount);
-                _mpb.SetInt("_SHBands", _isUsingGLES ? 0 : _shBands);
-                _mpb.SetInt("_SHCoeffsPerSplat", _isUsingGLES ? 0 : _shCoeffsPerSplat);
+                _mpb.SetInt("_NumSplats", visibleCount);
 
                 // Custom model matrices (UNITY_MATRIX_M can't be written in URP constant buffers)
                 _mpb.SetMatrix("_SplatObjectToWorld", transform.localToWorldMatrix);
@@ -736,9 +1186,7 @@ namespace GaussianSplatting
                 // Immediate path (beginCameraRendering / built-in fallback)
                 _activeMaterial.SetVector("_ViewportSize", viewportSize);
                 _activeMaterial.SetFloat("_IsOrtho", camera.orthographic ? 1f : 0f);
-                _activeMaterial.SetInt("_NumSplats", _visibleCount);
-                _activeMaterial.SetInt("_SHBands", _isUsingGLES ? 0 : _shBands);
-                _activeMaterial.SetInt("_SHCoeffsPerSplat", _isUsingGLES ? 0 : _shCoeffsPerSplat);
+                _activeMaterial.SetInt("_NumSplats", visibleCount);
 
                 // Custom model matrices (UNITY_MATRIX_M can't be written in URP constant buffers)
                 _activeMaterial.SetMatrix("_SplatObjectToWorld", transform.localToWorldMatrix);
@@ -748,25 +1196,25 @@ namespace GaussianSplatting
             // Draw
             // 6 vertices per splat (2 triangles)
             // Recalculate world bounds from current transform (so rotation/movement works)
-            var bounds = _localBounds.size.sqrMagnitude > 0
-                ? TransformBounds(_localBounds, transform.localToWorldMatrix)
+            var bounds = _localBounds.size.sqrMagnitude > 0 
+                ? TransformBounds(_localBounds, transform.localToWorldMatrix) 
                 : new Bounds(transform.position, Vector3.one * 100000f);
-
+            
             if (cmd != null)
             {
                 // URP Render Feature path: use CommandBuffer for proper matrix setup
-                cmd.DrawProcedural(Matrix4x4.identity, _activeMaterial, 0, MeshTopology.Triangles, _visibleCount * 6, 1, _mpb);
+                cmd.DrawProcedural(Matrix4x4.identity, _activeMaterial, 0, MeshTopology.Triangles, visibleCount * 6, 1, _mpb);
             }
             else if (GraphicsSettings.currentRenderPipeline == null)
             {
                 // Built-in RP: DrawProceduralNow inside OnRenderObject is the most reliable path.
                 _activeMaterial.SetPass(0);
-                Graphics.DrawProceduralNow(MeshTopology.Triangles, _visibleCount * 6, 1);
+                Graphics.DrawProceduralNow(MeshTopology.Triangles, visibleCount * 6, 1);
             }
             else
             {
                 // SRP fallback (when not using render feature): bounds-based draw call
-                Graphics.DrawProcedural(_activeMaterial, bounds, MeshTopology.Triangles, _visibleCount * 6, 1, camera);
+                Graphics.DrawProcedural(_activeMaterial, bounds, MeshTopology.Triangles, visibleCount * 6, 1, camera);
             }
         }
 
@@ -776,113 +1224,106 @@ namespace GaussianSplatting
             if (!_firstRenderLogged)
             {
                 _firstRenderLogged = true;
-                Debug.Log($"[GS-PERF] First render (RasterCB)! Camera={camera.name}");
+                Debug.Log($"[GS-PERF] First render call (RasterCB)! Camera={camera.name}, UseRenderFeature={UseRenderFeature}");
             }
-
+            
+            // Get or create per-camera state (each camera gets its own order buffer, sorter, and visible count)
+            var camState = GetOrCreateCameraState(camera);
+            
             // Track frame time for this path too
             float currentTime = Time.realtimeSinceStartup;
             float frameTime = (currentTime - _lastFrameTime) * 1000f;
             _lastFrameTime = currentTime;
             _avgFrameTimeMs = Mathf.Lerp(_avgFrameTimeMs, frameTime, 0.1f);
-
+            
             // Sort based on frame frequency (share counter with other render path)
             _frameCounter++;
             bool shouldSort = (_frameCounter % SortEveryNFrames) == 0;
-
+            
             if (shouldSort)
             {
+                // Apply mesh deformation BEFORE sorting (if enabled)
+                // Note: This modifies the shared position buffer, which is fine since all cameras see the same deformed mesh
+                if (_meshDeformer != null && _meshDeformer.IsInitialized)
+                {
+                    _meshDeformer.ApplyDeformation(_glesPosScale, _glesRotation, _glesColor);
+                }
+                
                 // transform camera into object space (matches gsplat-instance.js sort path)
                 var camPosOS = transform.InverseTransformPoint(camera.transform.position);
                 var camDirOS = transform.InverseTransformDirection(camera.transform.forward).normalized;
 
-                if (SortingAlgorithm == SortAlgorithm.None && _isUsingGLES)
+                if (SortingAlgorithm == SortAlgorithm.None)
                 {
                     // No sorting - use identity order (fastest, may have visual artifacts)
-                    _visibleCount = _count;
+                    camState.VisibleCount = _count;
                 }
-                else if (_gpuSorterBitonic != null)
+                else if (camState.BitonicSorter != null)
                 {
-                    // Bitonic sort path
+                    // Bitonic sort path (per-camera sorter)
                     Matrix4x4 sortModelMatrix = transform.localToWorldMatrix;
                     Matrix4x4 sortViewMatrix = camera.worldToCameraMatrix;
                     Matrix4x4 modelViewMatrix = sortViewMatrix * sortModelMatrix;
-
+                    
                     if (EnableFrustumCulling)
                     {
                         Matrix4x4 viewProjMatrix = camera.projectionMatrix * sortViewMatrix * sortModelMatrix;
-                        if (_gpuSorterBitonic.Sort(_glesPosScale, _orderBuffer, modelViewMatrix, viewProjMatrix, camPosOS, camDirOS, FrustumCullMargin, out int visible))
+                        if (camState.BitonicSorter.Sort(_glesPosScale, camState.OrderBuffer, modelViewMatrix, viewProjMatrix, camPosOS, camDirOS, FrustumCullMargin, out int visible))
                         {
-                            _visibleCount = visible;
+                            camState.VisibleCount = visible;
                         }
                     }
                     else
                     {
-                        _gpuSorterBitonic.Sort(_glesPosScale, _orderBuffer, modelViewMatrix, camPosOS, camDirOS);
-                        _visibleCount = _count;
+                        camState.BitonicSorter.Sort(_glesPosScale, camState.OrderBuffer, modelViewMatrix, camPosOS, camDirOS);
+                        camState.VisibleCount = _count;
                     }
                 }
-                else if (_gpuSorterGLES != null)
+                else if (camState.RadixSorter != null)
                 {
-                    // Radix sort path
+                    // Radix sort path (per-camera sorter)
                     Matrix4x4 sortModelMatrix = transform.localToWorldMatrix;
                     Matrix4x4 sortViewMatrix = camera.worldToCameraMatrix;
                     Matrix4x4 modelViewMatrix = sortViewMatrix * sortModelMatrix;
-
+                    
                     if (EnableFrustumCulling)
                     {
                         Matrix4x4 viewProjMatrix = camera.projectionMatrix * sortViewMatrix * sortModelMatrix;
-                        if (_gpuSorterGLES.Sort(_glesPosScale, _orderBuffer, modelViewMatrix, viewProjMatrix, camPosOS, camDirOS, FrustumCullMargin, out int visible))
+                        if (camState.RadixSorter.Sort(_glesPosScale, camState.OrderBuffer, modelViewMatrix, viewProjMatrix, camPosOS, camDirOS, FrustumCullMargin, out int visible))
                         {
-                            _visibleCount = visible;
+                            camState.VisibleCount = visible;
                         }
                     }
                     else
                     {
-                        _gpuSorterGLES.Sort(_glesPosScale, _orderBuffer, modelViewMatrix, camPosOS, camDirOS);
-                        _visibleCount = _count;
+                        camState.RadixSorter.Sort(_glesPosScale, camState.OrderBuffer, modelViewMatrix, camPosOS, camDirOS);
+                        camState.VisibleCount = _count;
                     }
-                }
-                else if (_gpuSorter != null)
-                {
-                    // Standard GPU sorter (wave intrinsics)
-                    Matrix4x4 sortModelMatrix = transform.localToWorldMatrix;
-                    Matrix4x4 sortViewMatrix = camera.worldToCameraMatrix;
-                    Matrix4x4 modelViewMatrix = sortViewMatrix * sortModelMatrix;
-                    _gpuSorter.Sort(_centersBuffer, _orderBuffer, modelViewMatrix, camPosOS, camDirOS);
-                    _visibleCount = _count;
                 }
                 // No CPU fallback - if no GPU sorter, identity order is used
             }
+
+            // Always draw all splats - culled ones are sorted to the end with max key
+            // and will be clipped by the GPU. This avoids flickering from async visible count latency.
+            int visibleCount = _count;
+            int reportedVisible = camState.VisibleCount > 0 ? camState.VisibleCount : _count;
 
             float w = camera.pixelWidth;
             float h = camera.pixelHeight;
             var viewportSize = new Vector4(w, h, 1f / Mathf.Max(1f, w), 1f / Mathf.Max(1f, h));
 
+
             // RasterCommandBuffer path (RenderGraph): use MPB so per-object/per-camera data is captured per draw.
             // Note: Buffers must be set on Material (not MaterialPropertyBlock) as MPB doesn't support buffers
-            _activeMaterial.SetBuffer("_SplatOrder", _orderBuffer);
-            if (_isUsingGLES)
-            {
-                _activeMaterial.SetBuffer("_SplatPosCovA", _glesPosScale);
-                _activeMaterial.SetBuffer("_SplatCovB", _glesRotation);
-                _activeMaterial.SetBuffer("_SplatCovCColor", _glesColor);
-            }
-            else
-            {
-                _activeMaterial.SetBuffer("_Centers", _centersBuffer);
-                _activeMaterial.SetBuffer("_Rotations", _rotationsBuffer);
-                _activeMaterial.SetBuffer("_Scales", _scalesBuffer);
-                _activeMaterial.SetBuffer("_Colors", _colorsBuffer);
-                if (_shCoeffsBuffer != null)
-                    _activeMaterial.SetBuffer("_SHCoeffs", _shCoeffsBuffer);
-            }
-
+            _activeMaterial.SetBuffer("_SplatOrder", camState.OrderBuffer);
+            _activeMaterial.SetBuffer("_SplatPosCovA", _glesPosScale);
+            _activeMaterial.SetBuffer("_SplatCovB", _glesRotation);
+            _activeMaterial.SetBuffer("_SplatCovCColor", _glesColor);
+            
             _mpb.Clear();
             _mpb.SetVector("_ViewportSize", viewportSize);
             _mpb.SetFloat("_IsOrtho", camera.orthographic ? 1f : 0f);
-            _mpb.SetInt("_NumSplats", _visibleCount);
-            _mpb.SetInt("_SHBands", _isUsingGLES ? 0 : _shBands);
-            _mpb.SetInt("_SHCoeffsPerSplat", _isUsingGLES ? 0 : _shCoeffsPerSplat);
+            _mpb.SetInt("_NumSplats", visibleCount);
             _mpb.SetMatrix("_SplatObjectToWorld", transform.localToWorldMatrix);
             _mpb.SetMatrix("_SplatWorldToObject", transform.worldToLocalMatrix);
 
@@ -890,14 +1331,14 @@ namespace GaussianSplatting
             var viewMatrix = camera.worldToCameraMatrix;
             var projMatrix = camera.projectionMatrix;
             cmd.SetViewProjectionMatrices(viewMatrix, projMatrix);
-
+            
             // Pass the projection matrix values for focal length calculation
             _mpb.SetFloat("_CamProjM00", projMatrix[0, 0]);
             _mpb.SetFloat("_CamProjM11", projMatrix[1, 1]);
 
             // Draw (URP/RenderGraph) - buffers are set on Material, other properties in MPB
-            cmd.DrawProcedural(Matrix4x4.identity, _activeMaterial, 0, MeshTopology.Triangles, _visibleCount * 6, 1, _mpb);
-
+            cmd.DrawProcedural(Matrix4x4.identity, _activeMaterial, 0, MeshTopology.Triangles, visibleCount * 6, 1, _mpb);
+            
             // Performance logging (shared with CommandBuffer path)
             if (LogPerformanceEveryNFrames > 0)
             {
@@ -906,8 +1347,8 @@ namespace GaussianSplatting
                 {
                     _perfLogCounter = 0;
                     float fps = _avgFrameTimeMs > 0 ? 1000f / _avgFrameTimeMs : 0;
-                    float cullPercent = _count > 0 ? (1f - (float)_visibleCount / _count) * 100f : 0;
-                    Debug.Log($"[GS-PERF] FPS: {fps:F1} | Frame: {_avgFrameTimeMs:F1}ms | Visible: {_visibleCount}/{_count} ({cullPercent:F0}% culled) | Vertices: {_visibleCount * 6}");
+                    float cullPercent = _count > 0 ? (1f - (float)reportedVisible / _count) * 100f : 0;
+                    Debug.Log($"[GS-PERF] FPS: {fps:F1} | Frame: {_avgFrameTimeMs:F1}ms | Visible: {reportedVisible}/{_count} ({cullPercent:F0}% culled) | Vertices: {visibleCount * 6}");
                 }
             }
         }
@@ -977,4 +1418,6 @@ namespace GaussianSplatting
         }
     }
 }
+
+
 
