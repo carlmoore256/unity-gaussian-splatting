@@ -2,6 +2,9 @@ using UnityEngine;
 using System.IO;
 namespace GaussianSplatting
 {
+    /// <summary>
+    /// Imported gaussian splat data ready for GPU. Useful for having a serialized asset in the editor.
+    /// </summary>
     public sealed class GaussianSplatAsset : ScriptableObject
     {
         [SerializeField] private GaussianSplatData _data = new GaussianSplatData();
@@ -9,6 +12,7 @@ namespace GaussianSplatting
         [Header("Metadata")]
         [Tooltip("Original source file path or URL")]
         public string SourcePath;
+
         [Tooltip("Pre-rendered thumbnail for editor preview")]
         public Texture2D Thumbnail;
 
@@ -19,23 +23,8 @@ namespace GaussianSplatting
         }
 
         public int Count => _data?.Count ?? 0;
-        public Vector3[] Centers => _data?.Centers;
-        public Vector4[] Rotations => _data?.Rotations;
-        public Vector3[] Scales => _data?.Scales;
-        public Vector4[] Colors => _data?.Colors;
-        public int ShBands => _data?.ShBands ?? 0;
-        public int ShCoeffsPerSplat => _data?.ShCoeffsPerSplat ?? 0;
-        public Vector3[] ShCoeffs => _data?.ShCoeffs;
 
-        public void SetData(GaussianSplatData data)
-        {
-            _data = data ?? new GaussianSplatData();
-        }
-
-        public GaussianSplatData GetDataCopy()
-        {
-            return new GaussianSplatData(_data);
-        }
+        public void SetData(GaussianSplatData data) => _data = data ?? new GaussianSplatData();
 
         public void LoadFromPly(byte[] plyBytes, CoordinateConversion conversion = CoordinateConversion.RightHandedToUnity)
         {
@@ -45,12 +34,12 @@ namespace GaussianSplatting
 
         public void LoadFromPlyFile(string filePath, CoordinateConversion conversion = CoordinateConversion.RightHandedToUnity)
         {
-            var bytes = System.IO.File.ReadAllBytes(filePath);
+            var bytes = File.ReadAllBytes(filePath);
             LoadFromPly(bytes, conversion);
             SourcePath = filePath;
         }
 
-        public static GaussianSplatAsset CreateFromPly(byte[] plyBytes, CoordinateConversion conversion = CoordinateConversion.RightHandedToUnity, string sourcePath = null)
+        public static GaussianSplatAsset CreateFromPlyBytes(byte[] plyBytes, CoordinateConversion conversion = CoordinateConversion.RightHandedToUnity, string sourcePath = null)
         {
             var asset = CreateInstance<GaussianSplatAsset>();
             asset.LoadFromPly(plyBytes, conversion);

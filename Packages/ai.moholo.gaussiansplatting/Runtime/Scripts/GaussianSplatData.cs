@@ -30,5 +30,10 @@ namespace GaussianSplatting
             ShCoeffsPerSplat = other.ShCoeffsPerSplat;
             ShCoeffs = other.ShCoeffs != null ? (Vector3[])other.ShCoeffs.Clone() : Array.Empty<Vector3>();
         }
+
+        public GaussianSplatData Clone()
+        {
+            return new GaussianSplatData(this);
+        }
     }
 }
