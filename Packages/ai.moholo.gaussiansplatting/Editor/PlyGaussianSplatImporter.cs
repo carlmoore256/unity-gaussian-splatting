@@ -23,11 +23,8 @@ namespace GaussianSplatting.Editor
         public override void OnImportAsset(AssetImportContext ctx)
         {
             var asset = GaussianSplatAsset.CreateFromPlyFile(ctx.assetPath, coordConversion);
-            asset.name = Path.GetFileNameWithoutExtension(ctx.assetPath);
-
             ctx.AddObjectToAsset("GaussianSplatAsset", asset);
             ctx.SetMainObject(asset);
-            
             Debug.Log($"[PlyGaussianSplatImporter] Imported {asset.Count} splats from {ctx.assetPath} (conversion={coordConversion})");
         }
     }

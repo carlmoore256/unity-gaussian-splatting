@@ -1,5 +1,5 @@
 using UnityEngine;
-
+using System.IO;
 namespace GaussianSplatting
 {
     public sealed class GaussianSplatAsset : ScriptableObject
@@ -62,6 +62,7 @@ namespace GaussianSplatting
         {
             var asset = CreateInstance<GaussianSplatAsset>();
             asset.LoadFromPlyFile(filePath, conversion);
+            asset.name = Path.GetFileNameWithoutExtension(filePath);
             return asset;
         }
     }
