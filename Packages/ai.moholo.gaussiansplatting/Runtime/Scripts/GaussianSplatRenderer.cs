@@ -100,6 +100,21 @@ namespace GaussianSplatting
         [HideInInspector]
         public int LogPerformanceEveryNFrames = 0;
 
+        [Header("Asset Reference (Optional)")]
+        [Tooltip("Pre-imported GaussianSplatAsset. If set, will auto-load on enable.")]
+        [SerializeField] private GaussianSplatAsset _asset;
+        
+        public GaussianSplatAsset Asset
+        {
+            get => _asset;
+            set
+            {
+                _asset = value;
+                if (_asset != null && isActiveAndEnabled)
+                    LoadAssetToGPU();
+            }
+        }
+
         private GraphicsBuffer _glesPosScale;
         private GraphicsBuffer _glesRotation;
         private GraphicsBuffer _glesColor;
@@ -118,9 +133,6 @@ namespace GaussianSplatting
         private ComputeShader _precomputeShader;
         private int _precomputeKernel;
         private const int GPU_PRECOMPUTE_THRESHOLD = 50000;
-        
-        [System.NonSerialized]
-        private bool _needsReload = false;
         
         private int _frameCounter = 0;
         
@@ -159,6 +171,9 @@ namespace GaussianSplatting
         {
             RenderPipelineManager.beginCameraRendering += BeginCameraRendering;
             if (_mpb == null) _mpb = new MaterialPropertyBlock();
+            
+            if (_asset != null && !IsLoaded)
+                LoadAssetToGPU();
         }
 
         private void OnDisable()
@@ -779,9 +794,16 @@ namespace GaussianSplatting
 
         public void OnBeforeSerialize() { }
 
-        public void OnAfterDeserialize()
+        public void OnAfterDeserialize() { }
+
+        public void LoadAssetToGPU()
         {
-            _needsReload = true;
+            if (_asset == null || _asset.Data == null)
+            {
+                Debug.LogWarning("[GaussianSplatRenderer] LoadAssetToGPU: No asset or asset data");
+                return;
+            }
+            SetSplatData(_asset.Data);
         }
     }
 }

@@ -2,22 +2,40 @@ using UnityEngine;
 
 namespace GaussianSplatting
 {
-    /// <summary>
-    /// Imported gaussian splat data ready for GPU upload.
-    /// Created automatically by the .ply importer.
-    /// </summary>
     public sealed class GaussianSplatAsset : ScriptableObject
     {
-        public int Count;
+        [SerializeField] private GaussianSplatData _data = new GaussianSplatData();
 
-        public Vector3[] Centers;
-        public Vector4[] Rotations; // (x,y,z,w)
-        public Vector3[] Scales;    // exp() already applied
-        public Vector4[] Colors;    // rgb in [0..1], a in [0..1]
+        [Header("Metadata")]
+        [Tooltip("Original source file path or URL")]
+        public string SourcePath;
+        [Tooltip("Pre-rendered thumbnail for editor preview")]
+        public Texture2D Thumbnail;
 
-        public int ShBands;          // 0..3
-        public int ShCoeffsPerSplat; // 0, 3, 8, 15
-        public Vector3[] ShCoeffs;   // length = Count * ShCoeffsPerSplat
+        public GaussianSplatData Data
+        {
+            get => _data;
+            set => _data = value ?? new GaussianSplatData();
+        }
+
+        public int Count => _data?.Count ?? 0;
+        public Vector3[] Centers => _data?.Centers;
+        public Vector4[] Rotations => _data?.Rotations;
+        public Vector3[] Scales => _data?.Scales;
+        public Vector4[] Colors => _data?.Colors;
+        public int ShBands => _data?.ShBands ?? 0;
+        public int ShCoeffsPerSplat => _data?.ShCoeffsPerSplat ?? 0;
+        public Vector3[] ShCoeffs => _data?.ShCoeffs;
+
+        public void SetData(GaussianSplatData data)
+        {
+            _data = data ?? new GaussianSplatData();
+        }
+
+        public GaussianSplatData GetDataCopy()
+        {
+            return new GaussianSplatData(_data);
+        }
     }
 }
 
